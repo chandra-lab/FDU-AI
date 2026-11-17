@@ -60,7 +60,9 @@ function Invoke-NativeQuiet {
 function Invoke-Native {
     param([Parameter(Mandatory)] [string] $Exe, [Parameter(ValueFromRemainingArguments)] [string[]] $Arguments)
     $ErrorActionPreference = 'Continue'
-    & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
+    & $Exe @Arguments 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { Write-Host "$($_.TargetObject)" } else { Write-Host "$_" }
+    }
     return $LASTEXITCODE
 }
 
