@@ -1,0 +1,52 @@
+{
+  "id": "qwen3.8-27b",
+  "display_name": "Qwen3.8-27B",
+  "provider": "openai-compatible",
+  "model_repository": "Qwen/Qwen3.8-27B",
+  "served_checkpoint": {
+    "repository": "RedHatAI/Qwen3.8-27B-INT4",
+    "revision": "e45c27e8f463817db788d141a73a3c235a0a7c0c"
+  },
+  "runtime_engine": "vllm",
+  "runtime_version": "0.34.0",
+  "inference_profile": "qwen3.8-27b-int4",
+  "quantization_format": "INT4 W4A16 (compressed-tensors, AWQ smoothing + GPTQ, group size 128)",
+  "context_window": 16384,
+  "native_context_window": 262144,
+  "api_endpoint": "http://university-ai-inference:8000/v1",
+  "served_model_name": "qwen3.8-27b",
+  "enabled": true,
+  "capabilities": {
+    "streaming": true,
+    "reasoning": true,
+    "tool_calling": true,
+    "vision": false
+  },
+  "gpu_requirements": {
+    "min_vram_gib": 20.6,
+    "min_compute_capability": "8.0",
+    "notes": "Fits one 24 GB card at 16K context / 4 sequences with fp8 KV cache, text-only."
+  },
+  "limits": {
+    "max_concurrent_sequences": 4,
+    "max_output_tokens": 4096
+  },
+  "default_generation_settings": {
+    "thinking": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0
+    },
+    "non_thinking": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 1.5,
+      "repetition_penalty": 1.0
+    }
+  }
+}
