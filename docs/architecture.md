@@ -20,68 +20,93 @@ NVIDIA RTX PRO 4000 Blackwell 24 GB). Source of requirements: the project spec (
                /                 \
  [university-ai-frontend]   [university-ai-backend] -- model registry, routing, queue, auth, RAG, agents
                               |      |        |
-          [university-ai-postgres] [university-ai-qdrant] [university-ai-inference]
-                                                           vLLM, OpenAI-compatible, GPU
-  All containers: private bridge network `university-ai`; no DB/vector/inference ports published
-  (inference optionally on 127.0.0.1:8000 for local testing only).
+          [university-ai-postgres] [university-ai-qdrant]   |  http://model-runner.docker.internal/engines/v1
+  ------------------------------------------------------------|------------------- Docker network `university-ai`
+                                                              v
+                                  Docker Desktop Model Runner (Windows host process)
+                                  llama.cpp b9879-cuda, Qwen3.8-27B GGUF, GPU
+                                  host TCP 127.0.0.1:12434 (localhost only)
 ```
 
-| Container | Role | Persistent data | Phase |
+| Component | Role | Persistent data | Phase |
 | --- | --- | --- | --- |
-| university-ai-inference | vLLM serving Qwen3.8-27B (INT4 build), OpenAI-compatible API, API-key protected | `C:\university-ai\models` (ro) | 1 |
+| Docker Model Runner | Serves Qwen3.8-27B (`ai/qwen3.8:27b`) through an OpenAI-compatible API on the GPU | `%USERPROFILE%\.docker\models` | 1 |
 | university-ai-backend | FastAPI: auth/RBAC, model registry + provider abstraction, routing, request queue, chat, RAG, agents | logs | 2 |
 | university-ai-postgres | users, departments, conversations, messages, usage | `C:\university-ai\postgres` | 2 |
 | university-ai-frontend | React/TS/Vite/Tailwind student + admin UI | none | 3-4 |
 | university-ai-qdrant | embeddings / RAG | `C:\university-ai\qdrant` | 5 |
 | university-ai-nginx | reverse proxy, TLS termination | certs/config | 2-3 |
 
-Each container is started, stopped and restarted by its own PowerShell script (`scripts\start-*.ps1`);
-no Docker Compose (§1, §16). All base images are pinned to explicit tags (§4).
+Each platform container is started, stopped and restarted by its own PowerShell script
+(`scripts\start-*.ps1`); no Docker Compose (§1, §16). All container base images are pinned to explicit
+tags (§4). Inference is managed by `scripts\start-inference.ps1` / `stop-all.ps1` through the
+`docker model` CLI.
+
+### How the backend reaches the model
+
+Docker Desktop resolves `model-runner.docker.internal` inside every container to its internal Model
+Runner endpoint, so the backend uses `http://model-runner.docker.internal/engines/v1` from the
+`university-ai` bridge network without any published port. `host.docker.internal:12434` also works
+because of the host TCP listener. Verified from a `python:3.13-slim` container on `university-ai`
+(`scripts\test-inference.ps1`). The host TCP listener is bound to 127.0.0.1 and was confirmed
+unreachable from the LAN address.
 
 ### Multi-model design (§5)
 
-The backend never hardcodes Qwen. The inference container is one *provider endpoint*; the backend's
-model registry (Phase 2, Postgres-backed, seeded from `inference/configs/models/*.json`) records model
-ID, display name, provider, repository, engine, quantization, context window, endpoint, enabled flag,
-GPU requirements and default generation settings. Phase 1 ships the seed record for
-`qwen3.8-27b` so the registry has a single source of truth for what the inference container serves.
-Adding a model = new inference profile (`inference/configs/<profile>.env`) + registry record.
+The backend never hardcodes Qwen. Model Runner is one *provider endpoint* (`provider: openai-compatible`);
+the backend's model registry (Phase 2, Postgres-backed, seeded from `inference/configs/models/*.json`)
+records model ID, display name, provider, repository, engine, quantization, context window, endpoint,
+enabled flag, GPU requirements and default generation settings. Phase 1 ships the seed record for
+`qwen3.8-27b`. Adding a model = new inference profile (`inference/configs/<profile>.env`) + registry record;
+a vLLM or SGLang container can be added later as another provider without changing the backend.
 
 ### Request path and capacity (§11)
 
-One 24 GB GPU serves one 27B model. vLLM is configured for at most 4 concurrent sequences; the backend
-(Phase 2) owns the fair-share queue, per-user rate limits, max context / output tokens, timeouts and
-cancellation, and returns a graceful "busy" response instead of overloading the GPU. 20-50 registered
-students are expected, not 50 simultaneous generations; no concurrency claim is made without the
-Phase 6 load test.
+One 24 GB GPU serves one 27B model. llama.cpp runs 4 parallel slots sharing one 32,768-token KV cache;
+the backend (Phase 2) owns the fair-share queue, per-user rate limits, max context / output tokens,
+timeouts and cancellation, and returns a graceful "busy" response instead of overloading the GPU.
+20-50 registered students are expected, not 50 simultaneous generations; no concurrency claim is made
+without the Phase 6 load test. Measured: ~28 tok/s for one request, ~78 tok/s aggregate (20 tok/s each)
+for 4 parallel requests.
 
 ## Model selection summary
 
 Full evidence: [model-configuration.md](model-configuration.md).
 
 - Target model (what the platform identifies as selected): **Qwen/Qwen3.8-27B**.
-- Served checkpoint: **RedHatAI/Qwen3.8-27B-INT4** (weight-only INT4 W4A16 of the same model, revision
-  `e45c27e8`), because BF16 (55.6 GB) and the official FP8 build (30.9 GB) cannot fit in 24 GB.
-- Engine: **vLLM v0.34.0** (`vllm/vllm-openai:v0.34.0`, CUDA 13.0, compiled for sm_120).
+- Served artifact: **`docker.io/ai/qwen3.8:27b`** from Docker Hub, digest `sha256:c3858e97...9490`:
+  `Qwen3.8-27B-UD-Q4_K_M.gguf` (16.56 GB, Unsloth Dynamic 4-bit) + `mmproj-F16.gguf` (0.93 GB, vision).
+- Engine: **llama.cpp b9879-cuda** inside Docker Desktop Model Runner, all layers on the GPU.
+- Decision (2026-11-17, user): Model Runner replaces the Phase 1 vLLM container
+  (RedHatAI INT4 on vLLM v0.34.0), which was removed together with its weights and image.
+
+## Deviations from the spec (accepted with the Model Runner decision)
+
+| Spec | What changed | Consequence / mitigation |
+| --- | --- | --- |
+| §3 engines: vLLM or SGLang preferred | llama.cpp (via Model Runner) serves the model | Weaker batching than vLLM under load (4 slots, no paged attention); measured throughput is still higher than the eager-mode vLLM build. vLLM remains an option as a second provider. |
+| §4 pinned image tags; §13 `inference/Dockerfile` | Inference is not a container we build or control; there is no inference Dockerfile or image tag | The model is pinned by **digest** (`MODEL_DIGEST` in the profile); `gpu-check.ps1` fails on a different digest and `start-inference.ps1` refuses to serve it. The llama.cpp backend version is reported by `status.ps1`, but Docker Desktop updates it; record it after each Desktop upgrade. |
+| §1 container-per-service started by its own script | Model Runner is a Docker Desktop feature running as a host process | `start-inference.ps1` / `stop-all.ps1` still own its lifecycle (enable, configure, load, unload). |
+| Inference API protected by an API key (Phase 1 vLLM design) | Model Runner has no authentication | Only reachable from 127.0.0.1 and local containers. Any local container can also call its management API (`/models` pull/delete); Phase 2+ must run only trusted containers on this host. The backend is the only component that may call it. |
+| §12 no prompt logging by default | llama.cpp logs request metadata, not prompts, in `docker model logs` | Re-check after Docker Desktop upgrades. |
+| GPU memory budget enforced by the engine | llama.cpp has no memory budget; on Windows (WDDM) an overrun may spill into shared system memory instead of failing | `gpu-check.ps1` checks the calculated footprint + 1 GiB margin before loading; `status.ps1` shows VRAM. |
 
 ## GPU / model compatibility risks
 
 | # | Risk | Impact | Mitigation |
 | --- | --- | --- | --- |
-| 1 | The RTX PRO 4000 also drives the Windows display (WDDM); desktop apps hold 1.9-2.2 GiB and it fluctuates. | vLLM refuses to start if free VRAM < its budget; less KV cache. | `gpu-check.ps1` requires budget + 0.5 GiB free. **Recommended:** connect monitors to the Core Ultra 9 285K iGPU (motherboard output) to free ~2 GiB. |
-| 2 | 24 GB is below every official Qwen artifact (BF16, FP8). | Must use a third-party 4-bit build. | RedHatAI INT4 (vLLM/llm-compressor maintainers; 98.5-101 % benchmark recovery reported). Disclosed in the registry `quantization` field; no silent substitution. |
-| 3 | FP4 formats (NVFP4/MXFP4 W4A4) are validated on 32 GB sm_120 cards only; NVFP4 builds are 21.9-26.4 GB. | Would not fit / unverified on this card. | Weight-only INT4 uses Marlin kernels (sm_80+), no FP4 tensor-core dependency. |
-| 4 | Thin VRAM headroom (~1.5 GiB beyond one 16K sequence). | Low context x concurrency envelope. | Conservative profile: 16K context, 4 seqs, fp8 KV, text-only, eager mode; tune from measured KV pool. |
-| 5 | WSL2: vLLM disables pinned memory; model loads over the Windows bind mount. | Slower load and host<->GPU copies; CPU offload impractical. | Offload not used. Weights read once at start. |
-| 6 | Hybrid Gated DeltaNet architecture (48 linear + 16 full-attention layers) is new. | Engine bugs / kernel gaps on sm_120. | vLLM recipe verifies this model family on RTX 5090 (sm_120); engine image pinned, upgrades tested via profile. |
-| 7 | Vision tower disabled (`--language-model-only`). | No image input in Phase 1. | Re-enable in a later profile if VRAM allows (costs ~0.9 GiB + encoder cache). |
-| 8 | vLLM v0.34.0 is one day old. | Possible regressions. | Validated end-to-end on this machine by `scripts\test-inference.ps1`; previous image tags remain available. |
+| 1 | The RTX PRO 4000 also drives the Windows display (WDDM); desktop apps hold ~2 GiB and it fluctuates. | Only ~2.6 GiB left free with the model loaded; spill to shared memory slows inference. | 1 GiB margin enforced by `gpu-check.ps1`. **Recommended:** connect monitors to the Core Ultra 9 285K iGPU to free ~2 GiB. |
+| 2 | 24 GB is below every official Qwen artifact (BF16 55.6 GB, FP8 30.9 GB). | A third-party 4-bit build is required. | Docker Hub `ai/` namespace build of Unsloth's UD-Q4_K_M GGUF; disclosed in the registry `quantization_format`; no silent substitution. |
+| 3 | Docker Desktop upgrades can replace the llama.cpp backend or change Model Runner behaviour. | Untested engine version. | Re-run `gpu-check.ps1` and `test-inference.ps1` after each Desktop upgrade. |
+| 4 | Model Runner's backend install depends on `%USERPROFILE%\.docker\bin`; when missing it silently falls back to "not installed" and requests hang. | No answers (observed 2026-11-17). | `gpu-check.ps1` requires the CUDA backend to be Running; fix in troubleshooting.md. |
+| 5 | Hybrid Gated DeltaNet architecture (48 linear + 16 full-attention layers) is new. | Engine bugs in llama.cpp. | Smoke tests cover chat, thinking, tools, streaming; Phase 6 load test. |
+| 6 | Vision projector is loaded (0.9 GiB). | Less VRAM headroom. | Kept because the model artifact bundles it; images become usable in a later phase. |
 
 ## Phase plan (§14)
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
-| 1 (this) | Repo structure, Docker network, GPU verification, model compatibility check, gated model download, Qwen inference container | `gpu-check.ps1` PASS; `test-inference.ps1` PASS against the running container |
+| 1 (this) | Repo structure, Docker network, GPU verification, model compatibility check, digest-verified model pull, Qwen inference via Model Runner | `gpu-check.ps1` PASS; `test-inference.ps1` PASS, including the container path |
 | 2 | FastAPI backend, PostgreSQL + Alembic, JWT auth/RBAC (no public registration), model registry + provider interface + health checks, request queue/limits, nginx | Backend tests (auth, authz, registry, health, chat API, limits) green; `/api/models` returns Qwen3.8-27B |
 | 3 | React student chat: streaming, Markdown/code highlighting, history, rename/delete, regenerate/stop, usage modes | E2E chat through nginx |
 | 4 | Admin dashboard: users/departments, enable/disable models, GPU/container health, usage stats | Admin flows tested |
