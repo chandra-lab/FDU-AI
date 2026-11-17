@@ -1,95 +1,71 @@
 <#
 .SYNOPSIS
-  Builds (if needed) and starts university-ai-inference (vLLM, OpenAI-compatible API on port 8000
-  inside the private network; optionally published on 127.0.0.1 only).
-.PARAMETER Build
-  Rebuild the inference image even if it exists.
-.PARAMETER Recreate
-  Remove and recreate the container if it is already running (picks up profile changes).
-.PARAMETER NoWait
-  Return immediately instead of waiting for /health.
+  Makes Qwen3.8-27B available through Docker Desktop Model Runner:
+  enables Model Runner (GPU, localhost-only TCP), pulls the model if missing and verifies its digest,
+  applies the profile's runtime config (context size, keep-alive) and loads it with a warm-up request.
+.PARAMETER Reload
+  Unload the model first so a changed CONTEXT_SIZE / KEEP_ALIVE takes effect.
 #>
 [CmdletBinding()]
-param([switch] $Build, [switch] $Recreate, [switch] $NoWait)
+param([switch] $Reload)
 
 . (Join-Path $PSScriptRoot 'lib\common.ps1')
 $cfg = Get-UaiConfig
 $inf = Get-InferenceProfile $cfg
 Assert-DockerReady
+$ref = $inf['MODEL_REF']
+$port = $inf['DMR_TCP_PORT']
 
-$name = $cfg['INFERENCE_CONTAINER']
-$state = Get-ContainerState $name
-if ($state -eq 'running' -and -not $Recreate) {
-    Write-Ok "$name is already running (use -Recreate to restart with the current profile)."
-    return
+$dmr = Get-DmrStatus
+if (-not $dmr.Running -or -not (Test-DmrTcpListening $inf)) {
+    Write-Step "Enabling Docker Model Runner (GPU, TCP 127.0.0.1:$port, CORS off)"
+    $rc = Invoke-Native docker desktop enable model-runner --gpu=enable "--tcp=$port" --cors=none
+    if ($rc -ne 0) { throw 'docker desktop enable model-runner failed.' }
+    Start-Sleep -Seconds 5
+    $dmr = Get-DmrStatus
+}
+if (-not $dmr.Running) { throw 'Model Runner is not running. See docs\troubleshooting.md.' }
+if ($dmr.LlamaStatus -ne 'Running' -or $dmr.LlamaDetails -notmatch 'cuda') {
+    throw ("llama.cpp CUDA backend not ready (status '{0}': {1}). See docs\troubleshooting.md." -f $dmr.LlamaStatus, $dmr.LlamaDetails)
+}
+Write-Ok "Model Runner backend: llama.cpp $($dmr.LlamaDetails)"
+
+Assert-CompatibilityPass -Config $cfg -InferenceProfile $inf
+
+$id = Get-DmrModelId $inf
+if (-not $id) {
+    Write-Step "Pulling $ref (~17.5 GB)"
+    $rc = Invoke-Native docker model pull $ref
+    if ($rc -ne 0) { throw "docker model pull $ref failed." }
+    $id = Get-DmrModelId $inf
+}
+if ($id -ne $inf['MODEL_DIGEST']) {
+    throw ("{0} resolves to {1}, not the tested digest {2}. Not loading it; re-test and update MODEL_DIGEST deliberately." -f $ref, $id, $inf['MODEL_DIGEST'])
+}
+Write-Ok ("{0} at tested digest {1}" -f $ref, $id.Substring(7, 12))
+
+if ($Reload -and (Test-DmrModelLoaded $inf)) {
+    Write-Step 'Unloading the model to apply new runtime settings'
+    $null = Invoke-DmrUnloadAll
 }
 
-if ($state -ne 'running') { Assert-CompatibilityPass -Config $cfg -InferenceProfile $inf }
-if (-not (Test-ModelDownloaded -Config $cfg -InferenceProfile $inf)) {
-    throw ("Weights for {0}@{1} are not fully downloaded. Run scripts\download-model.ps1 (status: scripts\status.ps1)." -f $inf['MODEL_REPO'], $inf['MODEL_REVISION'])
-}
-if (-not $cfg['INFERENCE_API_KEY'] -or $cfg['INFERENCE_API_KEY'] -eq 'CHANGE_ME') {
-    throw 'INFERENCE_API_KEY is not set in .env. Run scripts\setup.ps1.'
-}
+Write-Step ("Configuring {0}: context-size={1}, keep-alive={2}" -f $ref, $inf['CONTEXT_SIZE'], $inf['KEEP_ALIVE'])
+$rc = Invoke-Native docker model configure ("--context-size={0}" -f $inf['CONTEXT_SIZE']) ("--keep-alive={0}" -f $inf['KEEP_ALIVE']) $ref
+if ($rc -ne 0) { throw 'docker model configure failed.' }
 
-& (Join-Path $PSScriptRoot 'create-network.ps1')
-
-$image = $cfg['INFERENCE_IMAGE']
-$imageExists = ((Invoke-NativeQuiet docker image inspect $image).ExitCode -eq 0)
-if ($Build -or -not $imageExists) {
-    Write-Step "Building $image from $($cfg['INFERENCE_BASE_IMAGE'])"
-    $rc = Invoke-Native docker build --build-arg ("VLLM_IMAGE={0}" -f $cfg['INFERENCE_BASE_IMAGE']) --label project=university-ai -t $image (Join-Path $RepoRoot 'inference')
-    if ($rc -ne 0) { throw 'docker build failed.' }
-}
-
-if ($state) {
-    Write-Step "Removing existing container $name ($state)"
-    & docker rm -f $name | Out-Null
-}
-
-$env:VLLM_API_KEY = $cfg['INFERENCE_API_KEY']
-$dockerArgs = @(
-    'run', '-d', '--name', $name,
-    '--network', $cfg['UAI_NETWORK'], '--network-alias', 'inference',
-    '--gpus', 'all', '--shm-size', '8g',
-    '--restart', 'unless-stopped',
-    '--label', 'project=university-ai',
-    '--log-opt', 'max-size=50m', '--log-opt', 'max-file=5',
-    '--env-file', $inf['PROFILE_PATH'],
-    '-e', ("MODEL_PATH={0}" -f (Get-ModelContainerPath $inf)),
-    '-e', 'VLLM_API_KEY',
-    '-v', ("{0}:/models:ro" -f (Join-Path $cfg['UAI_DATA_ROOT'] 'models'))
-)
-$port = $cfg['INFERENCE_HOST_PORT']
-if ($port) { $dockerArgs += @('-p', ("127.0.0.1:{0}:8000" -f $port)) }
-$dockerArgs += $image
-
-Write-Step ("Starting {0}: {1} as '{2}' (max_model_len={3}, max_num_seqs={4}, gpu_mem={5})" -f $name, $inf['MODEL_REPO'], $inf['SERVED_MODEL_NAME'], $inf['MAX_MODEL_LEN'], $inf['MAX_NUM_SEQS'], $inf['GPU_MEMORY_UTILIZATION'])
-$rc = Invoke-Native docker @dockerArgs
-Remove-Item Env:\VLLM_API_KEY
-if ($rc -ne 0) { throw "docker run failed for $name." }
-if ($NoWait) { Write-Ok "Started. Follow startup with: docker logs -f $name"; return }
-
-$timeout = [int]$cfg['INFERENCE_STARTUP_TIMEOUT']
+Write-Step 'Loading the model (warm-up request)'
+$body = @{
+    model = $inf['SERVED_MODEL_ID']; max_tokens = 1
+    messages = @(@{ role = 'user'; content = 'ping' })
+    chat_template_kwargs = @{ enable_thinking = $false }
+} | ConvertTo-Json -Depth 5
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-Write-Step "Waiting up to $timeout s for the model to load (docker logs -f $name for detail)"
-while ($sw.Elapsed.TotalSeconds -lt $timeout) {
-    Start-Sleep -Seconds 10
-    $s = Get-ContainerState $name
-    if ($s -ne 'running') {
-        $null = Invoke-Native docker logs --tail 40 $name
-        throw "$name stopped during startup (state: $s). See logs above and docs\troubleshooting.md."
-    }
-    $healthy = $false
-    if ($port) {
-        try { $healthy = ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://127.0.0.1:$port/health").StatusCode -eq 200) } catch { }
-    } else {
-        $healthy = ((& docker inspect $name --format '{{.State.Health.Status}}') -eq 'healthy')
-    }
-    if ($healthy) {
-        Write-Ok ("{0} healthy after {1:N0} s." -f $name, $sw.Elapsed.TotalSeconds)
-        return
-    }
-    Write-Host ("  ... {0:N0} s" -f $sw.Elapsed.TotalSeconds)
+try {
+    $null = Invoke-RestMethod -Method Post -TimeoutSec ([int]$cfg['INFERENCE_STARTUP_TIMEOUT']) -ContentType 'application/json' -Body $body ("{0}/chat/completions" -f (Get-DmrBaseUrl $inf))
+} catch {
+    throw "Warm-up request failed after $([int]$sw.Elapsed.TotalSeconds) s: $($_.Exception.Message). Check: docker model logs"
 }
-throw "$name did not become healthy within $timeout s. Check: docker logs $name"
+if (-not (Test-DmrModelLoaded $inf)) { throw 'Warm-up answered but the model is not listed by docker model ps.' }
+Write-Ok ("{0} loaded and answering after {1:N0} s." -f $inf['TARGET_MODEL_DISPLAY_NAME'], $sw.Elapsed.TotalSeconds)
+Write-Host ("  Host API:      {0}" -f (Get-DmrBaseUrl $inf))
+Write-Host ("  Container API: {0}" -f $inf['DMR_CONTAINER_BASE_URL'])

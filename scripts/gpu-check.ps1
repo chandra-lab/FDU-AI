@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-  Verifies the GPU on Windows and inside Docker, then checks that the selected inference profile
-  fits in VRAM and on disk. Writes <UAI_DATA_ROOT>\logs\compatibility-check.json.
-  download-model.ps1 and start-inference.ps1 refuse to run without a recent PASS for the same profile.
+  Verifies the GPU (Windows + Docker), Docker Model Runner (CUDA llama.cpp backend, localhost-only TCP),
+  the pinned model digest, and that the profile's context size fits in VRAM.
+  Writes <UAI_DATA_ROOT>\logs\compatibility-check.json; start-inference.ps1 refuses to pull or load
+  the model without a recent PASS for the same profile.
 .PARAMETER SkipDockerTest
-  Skip the container nvidia-smi test (not recommended; the result is recorded as not verified).
+  Skip the container nvidia-smi test (recorded as a warning).
 #>
 [CmdletBinding()]
 param([switch] $SkipDockerTest)
@@ -21,8 +22,7 @@ $GiB = [math]::Pow(2, 30)
 
 Write-Step 'Host GPU (nvidia-smi on Windows)'
 $gpu = $null
-$smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
-if (-not $smi) {
+if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
     Add-Check 'host.nvidia-smi' 'FAIL' 'nvidia-smi not found; install/repair the NVIDIA Windows driver.'
 } else {
     $lines = @(& nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,driver_version,compute_cap --format=csv,noheader,nounits 2>$null)
@@ -36,25 +36,17 @@ if (-not $smi) {
             driver = $f[4]; compute_capability = $f[5]
         }
         Add-Check 'host.nvidia-smi' 'PASS' ("{0}, driver {1}, compute {2}, {3} MiB total / {4} MiB free" -f $gpu.name, $gpu.driver, $gpu.compute_capability, $gpu.total_mib, $gpu.free_mib)
-        if ([double]$gpu.compute_capability -ge [double]$inf['MIN_COMPUTE_CAPABILITY']) {
-            Add-Check 'gpu.compute_capability' 'PASS' ("{0} >= {1} required by {2}" -f $gpu.compute_capability, $inf['MIN_COMPUTE_CAPABILITY'], $inf['QUANTIZATION'])
-        } else {
-            Add-Check 'gpu.compute_capability' 'FAIL' ("{0} < {1} required by {2}" -f $gpu.compute_capability, $inf['MIN_COMPUTE_CAPABILITY'], $inf['QUANTIZATION'])
-        }
+        $ccStatus = if ([double]$gpu.compute_capability -ge [double]$inf['MIN_COMPUTE_CAPABILITY']) { 'PASS' } else { 'FAIL' }
+        Add-Check 'gpu.compute_capability' $ccStatus ("{0} (minimum {1})" -f $gpu.compute_capability, $inf['MIN_COMPUTE_CAPABILITY'])
     }
 }
 
-Write-Step 'Docker GPU passthrough'
+Write-Step 'Docker engine and GPU passthrough'
 $dockerGpu = $null
 if (-not (Test-DockerReady)) {
     Add-Check 'docker.engine' 'FAIL' 'Docker engine not reachable; start Docker Desktop.'
 } else {
-    $runtimes = & docker info --format '{{json .Runtimes}}' | ConvertFrom-Json
-    if ($runtimes.PSObject.Properties.Name -contains 'nvidia') {
-        Add-Check 'docker.engine' 'PASS' 'Docker reachable; nvidia runtime registered.'
-    } else {
-        Add-Check 'docker.engine' 'WARN' 'Docker reachable; no nvidia runtime listed (Docker Desktop may still support --gpus).'
-    }
+    Add-Check 'docker.engine' 'PASS' 'Docker reachable.'
     if ($SkipDockerTest) {
         Add-Check 'docker.gpu' 'WARN' 'Skipped by -SkipDockerTest.'
     } else {
@@ -66,59 +58,74 @@ if (-not (Test-DockerReady)) {
             $dockerGpu = ($out | Select-Object -Last 1).ToString().Trim()
             Add-Check 'docker.gpu' 'PASS' ("{0} sees: {1}" -f $cfg['CUDA_TEST_IMAGE'], $dockerGpu)
         } else {
-            Add-Check 'docker.gpu' 'FAIL' ("docker run --gpus all failed: {0}" -f (($out | Select-Object -Last 3) -join ' '))
+            Add-Check 'docker.gpu' 'WARN' ("container GPU test failed (Model Runner runs on the host, so inference may still work): {0}" -f (($out | Select-Object -Last 2) -join ' '))
         }
     }
 }
 
-Write-Step ("VRAM budget for profile '{0}' ({1} via {2})" -f $cfg['INFERENCE_PROFILE'], $inf['TARGET_MODEL'], $inf['MODEL_REPO'])
+Write-Step 'Docker Model Runner'
+$dmr = Get-DmrStatus
+$modelId = $null; $loaded = $false
+if (-not $dmr.Running) {
+    Add-Check 'dmr.running' 'FAIL' 'Model Runner is not running: docker desktop enable model-runner --gpu=enable --tcp=12434 --cors=none'
+} else {
+    Add-Check 'dmr.running' 'PASS' 'Model Runner is running.'
+    if ($dmr.LlamaStatus -eq 'Running' -and $dmr.LlamaDetails -match 'cuda') {
+        Add-Check 'dmr.backend' 'PASS' ("llama.cpp {0}" -f $dmr.LlamaDetails)
+    } elseif ($dmr.LlamaStatus -eq 'Running') {
+        Add-Check 'dmr.backend' 'FAIL' ("llama.cpp is running without CUDA ({0}); expect ~3 tok/s on CPU. See docs\troubleshooting.md" -f $dmr.LlamaDetails)
+    } else {
+        Add-Check 'dmr.backend' 'FAIL' ("llama.cpp backend status '{0}': {1}. See docs\troubleshooting.md" -f $dmr.LlamaStatus, $dmr.LlamaDetails)
+    }
+    $listen = @(Get-NetTCPConnection -LocalPort ([int]$inf['DMR_TCP_PORT']) -State Listen -ErrorAction SilentlyContinue)
+    if (-not $listen) {
+        Add-Check 'dmr.tcp' 'WARN' ("host TCP {0} not enabled; start-inference.ps1 enables it" -f $inf['DMR_TCP_PORT'])
+    } elseif (@($listen | Where-Object { $_.LocalAddress -notin '127.0.0.1', '::1' }).Count -gt 0) {
+        Add-Check 'dmr.tcp' 'FAIL' ("port {0} is bound to {1}; it must be localhost-only" -f $inf['DMR_TCP_PORT'], (($listen.LocalAddress | Sort-Object -Unique) -join ', '))
+    } else {
+        Add-Check 'dmr.tcp' 'PASS' ("API on 127.0.0.1:{0} only" -f $inf['DMR_TCP_PORT'])
+    }
+    $modelId = Get-DmrModelId $inf
+    if (-not $modelId) {
+        Add-Check 'dmr.model' 'PASS' ("{0} not pulled yet; start-inference.ps1 will pull it (~17.5 GB)" -f $inf['MODEL_REF'])
+    } elseif ($modelId -eq $inf['MODEL_DIGEST']) {
+        Add-Check 'dmr.model' 'PASS' ("{0} present at tested digest {1}" -f $inf['MODEL_REF'], $modelId.Substring(7, 12))
+    } else {
+        Add-Check 'dmr.model' 'FAIL' ("{0} is {1}, not the tested {2}. Re-test and update MODEL_DIGEST deliberately; no silent substitution." -f $inf['MODEL_REF'], $modelId, $inf['MODEL_DIGEST'])
+    }
+    $loaded = Test-DmrModelLoaded $inf
+}
+
+Write-Step ("VRAM for profile '{0}' (context {1} tokens)" -f $cfg['INFERENCE_PROFILE'], $inf['CONTEXT_SIZE'])
 $math = $null
 if ($gpu) {
     $totalGiB = $gpu.total_mib / 1024
     $freeGiB = $gpu.free_mib / 1024
-    $util = [double]$inf['GPU_MEMORY_UTILIZATION']
-    $budget = $util * $totalGiB
-    $kv = [double]$inf['MAX_MODEL_LEN'] * [double]$inf['KV_BYTES_PER_TOKEN'] / $GiB
-    $state = [double]$inf['MAX_NUM_SEQS'] * [double]$inf['STATE_BYTES_PER_SEQ'] / $GiB
-    $required = [double]$inf['EST_WEIGHTS_GIB'] + [double]$inf['EST_RUNTIME_OVERHEAD_GIB'] + $kv + $state
+    $kv = [double]$inf['CONTEXT_SIZE'] * [double]$inf['KV_BYTES_PER_TOKEN'] / $GiB
+    $required = [double]$inf['EST_BASE_GIB'] + $kv
+    $margin = [double]$inf['VRAM_SAFETY_MARGIN_GIB']
     $math = [ordered]@{
         total_gib = [math]::Round($totalGiB, 2); free_gib = [math]::Round($freeGiB, 2)
-        gpu_memory_utilization = $util; vllm_budget_gib = [math]::Round($budget, 2)
-        weights_gib = [double]$inf['EST_WEIGHTS_GIB']; overhead_gib = [double]$inf['EST_RUNTIME_OVERHEAD_GIB']
-        kv_one_full_sequence_gib = [math]::Round($kv, 2); linear_attention_state_gib = [math]::Round($state, 2)
-        required_minimum_gib = [math]::Round($required, 2); headroom_for_extra_kv_gib = [math]::Round($budget - $required, 2)
+        model_base_gib = [double]$inf['EST_BASE_GIB']; kv_cache_gib = [math]::Round($kv, 2)
+        model_required_gib = [math]::Round($required, 2); safety_margin_gib = $margin
+        model_loaded_now = $loaded
     }
-    $math.GetEnumerator() | ForEach-Object { '    {0,-28} {1}' -f $_.Key, $_.Value } | Write-Host
-
-    if ($required -le $budget) {
-        Add-Check 'vram.fit' 'PASS' ("needs {0:N2} GiB of a {1:N2} GiB vLLM budget ({2:N2} GiB spare for KV cache)" -f $required, $budget, ($budget - $required))
+    $math.GetEnumerator() | ForEach-Object { '    {0,-22} {1}' -f $_.Key, $_.Value } | Write-Host
+    if ($loaded) {
+        if ($freeGiB -ge $margin) { Add-Check 'vram.fit' 'PASS' ("model resident; {0:N2} GiB free >= {1} GiB margin" -f $freeGiB, $margin) }
+        else { Add-Check 'vram.fit' 'WARN' ("model resident but only {0:N2} GiB free; desktop apps may push it into shared memory" -f $freeGiB) }
+    } elseif ($required + $margin -le $freeGiB) {
+        Add-Check 'vram.fit' 'PASS' ("needs {0:N2} GiB + {1} GiB margin; {2:N2} GiB free" -f $required, $margin, $freeGiB)
     } else {
-        Add-Check 'vram.fit' 'FAIL' ("needs {0:N2} GiB but the vLLM budget is {1:N2} GiB; lower MAX_MODEL_LEN/MAX_NUM_SEQS or choose another checkpoint (no automatic substitution)" -f $required, $budget)
-    }
-
-    $containerState = Get-ContainerState $cfg['INFERENCE_CONTAINER']
-    if ($containerState -eq 'running') {
-        Add-Check 'vram.free_at_start' 'PASS' ("{0} is running and holds its memory; free-memory check skipped" -f $cfg['INFERENCE_CONTAINER'])
-    } elseif ($freeGiB -ge $budget + 0.5) {
-        Add-Check 'vram.free_at_start' 'PASS' ("{0:N2} GiB free >= {1:N2} GiB budget + 0.5 GiB margin" -f $freeGiB, $budget)
-    } elseif ($freeGiB -ge $budget) {
-        Add-Check 'vram.free_at_start' 'WARN' ("{0:N2} GiB free is within 0.5 GiB of the {1:N2} GiB budget; close GPU-heavy desktop apps before starting" -f $freeGiB, $budget)
-    } else {
-        Add-Check 'vram.free_at_start' 'FAIL' ("only {0:N2} GiB free; vLLM needs {1:N2} GiB free at startup (close GPU apps or lower GPU_MEMORY_UTILIZATION)" -f $freeGiB, $budget)
+        Add-Check 'vram.fit' 'FAIL' ("needs {0:N2} GiB + {1} GiB margin but only {2:N2} GiB free; lower CONTEXT_SIZE or free VRAM (other GPU apps/containers)" -f $required, $margin, $freeGiB)
     }
 }
 
-Write-Step 'Disk space'
-$modelReady = Test-ModelDownloaded -Config $cfg -InferenceProfile $inf
-$drive = Split-Path -Qualifier $cfg['UAI_DATA_ROOT']
-$freeDiskGB = [math]::Round((Get-PSDrive ($drive.TrimEnd(':'))).Free / 1e9, 1)
-if ($modelReady) {
-    Add-Check 'disk.model' 'PASS' ("weights already present ({0}); {1} GB free on {2}" -f $inf['MODEL_REVISION'].Substring(0, 8), $freeDiskGB, $drive)
-} elseif ($freeDiskGB -ge [double]$inf['REQUIRED_DISK_GB']) {
-    Add-Check 'disk.model' 'PASS' ("{0} GB free on {1} >= {2} GB needed" -f $freeDiskGB, $drive, $inf['REQUIRED_DISK_GB'])
-} else {
-    Add-Check 'disk.model' 'FAIL' ("{0} GB free on {1} < {2} GB needed" -f $freeDiskGB, $drive, $inf['REQUIRED_DISK_GB'])
-}
+Write-Step 'Disk space (Model Runner stores models under %USERPROFILE%\.docker\models)'
+$freeDiskGB = [math]::Round((Get-PSDrive (Split-Path -Qualifier $env:USERPROFILE).TrimEnd(':')).Free / 1e9, 1)
+if ($modelId) { Add-Check 'disk.model' 'PASS' ("model already pulled; {0} GB free" -f $freeDiskGB) }
+elseif ($freeDiskGB -ge 25) { Add-Check 'disk.model' 'PASS' ("{0} GB free >= 25 GB" -f $freeDiskGB) }
+else { Add-Check 'disk.model' 'FAIL' ("{0} GB free < 25 GB needed" -f $freeDiskGB) }
 
 $failed = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
 $overall = if ($failed -eq 0) { 'PASS' } else { 'FAIL' }
@@ -129,12 +136,13 @@ $report = [ordered]@{
     profile = $cfg['INFERENCE_PROFILE']
     profile_sha256 = $inf['PROFILE_SHA256']
     target_model = $inf['TARGET_MODEL']
-    model_repo = $inf['MODEL_REPO']
-    model_revision = $inf['MODEL_REVISION']
+    model_ref = $inf['MODEL_REF']
+    model_digest_expected = $inf['MODEL_DIGEST']
+    model_digest_local = $modelId
+    dmr_backend = $dmr.LlamaDetails
     gpu = $gpu
     docker_gpu = $dockerGpu
     vram = $math
-    model_downloaded = $modelReady
     checks = $checks
 }
 $logDir = Join-Path $cfg['UAI_DATA_ROOT'] 'logs'

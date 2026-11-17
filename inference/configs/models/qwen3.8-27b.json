@@ -4,32 +4,35 @@
   "provider": "openai-compatible",
   "model_repository": "Qwen/Qwen3.8-27B",
   "served_checkpoint": {
-    "repository": "RedHatAI/Qwen3.8-27B-INT4",
-    "revision": "e45c27e8f463817db788d141a73a3c235a0a7c0c"
+    "repository": "docker.io/ai/qwen3.8:27b",
+    "digest": "sha256:c3858e9716a395da25ba17d1f8e9eb7ff740a399fc5ff182ac99741ada149490",
+    "files": ["Qwen3.8-27B-UD-Q4_K_M.gguf", "mmproj-F16.gguf"]
   },
-  "runtime_engine": "vllm",
-  "runtime_version": "0.34.0",
-  "inference_profile": "qwen3.8-27b-int4",
-  "quantization_format": "INT4 W4A16 (compressed-tensors, AWQ smoothing + GPTQ, group size 128)",
-  "context_window": 16384,
+  "runtime_engine": "docker-model-runner (llama.cpp)",
+  "runtime_version": "llama.cpp b9879-cuda, Docker Desktop 4.98.0",
+  "inference_profile": "qwen3.8-27b-dmr",
+  "quantization_format": "GGUF UD-Q4_K_M (Unsloth Dynamic 4-bit), F16 vision projector, F16 KV cache",
+  "context_window": 32768,
   "native_context_window": 262144,
-  "api_endpoint": "http://university-ai-inference:8000/v1",
-  "served_model_name": "qwen3.8-27b",
+  "api_endpoint": "http://model-runner.docker.internal/engines/v1",
+  "served_model_name": "docker.io/ai/qwen3.8:27b",
+  "api_key_required": false,
   "enabled": true,
   "capabilities": {
     "streaming": true,
     "reasoning": true,
     "tool_calling": true,
-    "vision": false
+    "vision": true
   },
   "gpu_requirements": {
-    "min_vram_gib": 20.6,
-    "min_compute_capability": "8.0",
-    "notes": "Fits one 24 GB card at 16K context / 4 sequences with fp8 KV cache, text-only."
+    "min_vram_gib": 19.6,
+    "min_compute_capability": "7.5",
+    "notes": "18.65 GiB resident at 32K context (all layers on GPU) plus a 1 GiB margin; one 24 GB card."
   },
   "limits": {
     "max_concurrent_sequences": 4,
-    "max_output_tokens": 4096
+    "max_output_tokens": 4096,
+    "notes": "context_window is the total KV cache shared by llama.cpp's 4 slots, not a per-request guarantee."
   },
   "default_generation_settings": {
     "thinking": {
@@ -46,7 +49,8 @@
       "top_k": 20,
       "min_p": 0.0,
       "presence_penalty": 1.5,
-      "repetition_penalty": 1.0
+      "repetition_penalty": 1.0,
+      "chat_template_kwargs": { "enable_thinking": false }
     }
   }
 }

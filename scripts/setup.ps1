@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  One-time host setup: persistent data directories, .env with generated secrets, Docker network.
+  One-time host setup: persistent data directories, .env, Docker network.
   Safe to re-run; never overwrites an existing .env or existing data.
 #>
 [CmdletBinding()]
@@ -13,18 +13,14 @@ if (Test-Path $envPath) {
     Write-Ok ".env already exists; leaving it unchanged."
 } else {
     Write-Step 'Creating .env from .env.example'
-    $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    $apiKey = 'uai-' + (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
-    $content = (Get-Content (Join-Path $RepoRoot '.env.example') -Raw) -replace 'INFERENCE_API_KEY=CHANGE_ME', "INFERENCE_API_KEY=$apiKey"
-    [System.IO.File]::WriteAllText($envPath, $content, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Ok ".env created with a generated INFERENCE_API_KEY."
+    Copy-Item (Join-Path $RepoRoot '.env.example') $envPath
+    Write-Ok '.env created.'
 }
 
 $cfg = Get-UaiConfig
 $root = $cfg['UAI_DATA_ROOT']
 Write-Step "Creating persistent data directories under $root"
-foreach ($sub in 'models', 'hf-cache', 'postgres', 'qdrant', 'logs', 'logs\inference', 'backups') {
+foreach ($sub in 'postgres', 'qdrant', 'logs', 'backups') {
     $p = Join-Path $root $sub
     if (-not (Test-Path $p)) {
         New-Item -ItemType Directory -Path $p | Out-Null
@@ -41,4 +37,4 @@ if (Test-DockerReady) {
 }
 
 Write-Host ''
-Write-Host 'Next: scripts\gpu-check.ps1  (must PASS before scripts\download-model.ps1 will run)'
+Write-Host 'Next: scripts\gpu-check.ps1  (must PASS before scripts\start-inference.ps1 will pull or load the model)'

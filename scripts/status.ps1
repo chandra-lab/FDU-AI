@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Shows network, container, GPU, model-download and inference API status.
+  Shows GPU, Docker network, containers, Docker Model Runner and inference API status.
 #>
 [CmdletBinding()]
 param()
@@ -21,27 +21,21 @@ if ($net) { Write-Ok "network '$net' exists" } else { Write-Warn "network '$($cf
 Write-Step 'Containers'
 & docker ps -a --filter 'label=project=university-ai' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
-Write-Step 'Model'
-$dir = Get-ModelLocalPath $cfg $inf
-if (Test-ModelDownloaded -Config $cfg -InferenceProfile $inf) {
-    Write-Ok ("{0}@{1} downloaded at {2}" -f $inf['MODEL_REPO'], $inf['MODEL_REVISION'].Substring(0, 8), $dir)
-} elseif (Test-Path $dir) {
-    $gb = (Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1e9
-    Write-Warn ("download incomplete: {0:N2} GB in {1}" -f $gb, $dir)
-    if ((Get-ContainerState 'university-ai-model-download') -eq 'running') { Write-Host '  download container running: docker logs -f university-ai-model-download' }
-} else {
-    Write-Warn 'not downloaded (scripts\download-model.ps1)'
-}
+Write-Step 'Docker Model Runner'
+$dmr = Get-DmrStatus
+if (-not $dmr.Running) { Write-Fail 'Model Runner not running.'; return }
+if ($dmr.LlamaDetails -match 'cuda') { Write-Ok "llama.cpp $($dmr.LlamaDetails)" } else { Write-Warn "llama.cpp $($dmr.LlamaStatus): $($dmr.LlamaDetails)" }
+$id = Get-DmrModelId $inf
+if ($id -eq $inf['MODEL_DIGEST']) { Write-Ok ("{0} pulled at tested digest" -f $inf['MODEL_REF']) }
+elseif ($id) { Write-Warn ("{0} digest {1} differs from tested {2}" -f $inf['MODEL_REF'], $id, $inf['MODEL_DIGEST']) }
+else { Write-Warn ("{0} not pulled (scripts\start-inference.ps1)" -f $inf['MODEL_REF']) }
+$null = Invoke-Native docker model ps
 
 Write-Step 'Inference API'
-$port = $cfg['INFERENCE_HOST_PORT']
-if ((Get-ContainerState $cfg['INFERENCE_CONTAINER']) -ne 'running') { Write-Warn "$($cfg['INFERENCE_CONTAINER']) not running"; return }
-if (-not $port) { Write-Host '  INFERENCE_HOST_PORT empty; API only reachable inside the Docker network.'; return }
+if (-not (Test-DmrTcpListening $inf)) { Write-Warn "host TCP $($inf['DMR_TCP_PORT']) not enabled (scripts\start-inference.ps1)"; return }
 try {
-    $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://127.0.0.1:$port/health"
-    Write-Ok "/health OK on 127.0.0.1:$port"
-    $models = Invoke-RestMethod -TimeoutSec 5 -Headers @{ Authorization = "Bearer $($cfg['INFERENCE_API_KEY'])" } "http://127.0.0.1:$port/v1/models"
-    foreach ($m in $models.data) { Write-Ok ("serving '{0}' (max_model_len {1})" -f $m.id, $m.max_model_len) }
+    $models = Invoke-RestMethod -TimeoutSec 5 ("{0}/models" -f (Get-DmrBaseUrl $inf))
+    foreach ($m in $models.data) { Write-Ok ("API lists '{0}' at {1}" -f $m.id, (Get-DmrBaseUrl $inf)) }
 } catch {
-    Write-Warn "API not ready: $($_.Exception.Message)"
+    Write-Warn "API not answering: $($_.Exception.Message)"
 }

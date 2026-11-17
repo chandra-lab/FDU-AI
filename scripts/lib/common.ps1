@@ -1,4 +1,4 @@
-# Shared helpers dot-sourced by the scripts in ..\  (Windows PowerShell 5.1 compatible).
+﻿# Shared helpers dot-sourced by the scripts in ..\  (Windows PowerShell 5.1 compatible).
 
 $ErrorActionPreference = 'Stop'
 
@@ -83,24 +83,7 @@ function Get-ContainerState {
     return "$($r.Output)".Trim()
 }
 
-# Weights are stored as plain files (hf download --local-dir), not in the symlinked HF hub cache:
-# symlinks created by Linux containers on a Windows bind mount are not reliably readable from Windows.
-function Get-ModelDirName {
-    param([Parameter(Mandatory)] $InferenceProfile)
-    return ($InferenceProfile['MODEL_REPO'] -replace '/', '--')
-}
-
-function Get-ModelLocalPath {
-    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] $InferenceProfile)
-    return Join-Path $Config['UAI_DATA_ROOT'] ("models\{0}" -f (Get-ModelDirName $InferenceProfile))
-}
-
-function Get-ModelContainerPath {
-    param([Parameter(Mandatory)] $InferenceProfile)
-    return '/models/' + (Get-ModelDirName $InferenceProfile)
-}
-
-# Gate used before any weight download or inference start: requires a PASS report from gpu-check.ps1
+# Gate used before any model pull or load: requires a PASS report from gpu-check.ps1
 # for the exact current profile file, no older than MaxAgeHours.
 function Assert-CompatibilityPass {
     param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] $InferenceProfile, [int] $MaxAgeHours = 24)
@@ -115,19 +98,56 @@ function Assert-CompatibilityPass {
     Write-Ok ("Compatibility check PASS for '{0}' at {1}" -f $r.profile, $r.checked_at)
 }
 
-function Test-ModelDownloaded {
-    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] $InferenceProfile)
-    $dir = Get-ModelLocalPath -Config $Config -InferenceProfile $InferenceProfile
-    $marker = Join-Path $dir '.uai-download.json'
-    if (-not (Test-Path $marker)) { return $false }
-    $m = Get-Content $marker -Raw | ConvertFrom-Json
-    if ($m.revision -ne $InferenceProfile['MODEL_REVISION'] -or $m.status -ne 'complete') { return $false }
-    $index = Join-Path $dir 'model.safetensors.index.json'
-    if (-not (Test-Path $index)) { return $false }
-    $files = (Get-Content $index -Raw | ConvertFrom-Json).weight_map.PSObject.Properties.Value | Sort-Object -Unique
-    foreach ($f in $files) {
-        $p = Join-Path $dir $f
-        if (-not (Test-Path $p) -or (Get-Item $p).Length -eq 0) { return $false }
-    }
-    return $true
+# --- Docker Desktop Model Runner (DMR) -------------------------------------------------------
+
+function Get-DmrBaseUrl {
+    param([Parameter(Mandatory)] $InferenceProfile)
+    return "http://127.0.0.1:{0}/engines/v1" -f $InferenceProfile['DMR_TCP_PORT']
 }
+
+# Parses `docker model status`: Running = runner up; LlamaStatus/LlamaDetails = llama.cpp backend row.
+function Get-DmrStatus {
+    $r = Invoke-NativeQuiet docker model status
+    $text = ($r.Output | ForEach-Object { "$_" }) -join "`n"
+    $running = ($text -match 'Docker Model Runner is running')
+    $status = $null; $details = $null
+    $m = [regex]::Match($text, '(?m)^llama\.cpp\s+(\S+(?:\s\S+)?)\s{2,}(.*)$')
+    if ($m.Success) { $status = $m.Groups[1].Value.Trim(); $details = $m.Groups[2].Value.Trim() }
+    return [pscustomobject]@{ Running = $running; LlamaStatus = $status; LlamaDetails = $details }
+}
+
+# Returns the local model ID (sha256 digest) for MODEL_REF, or $null if it is not pulled.
+function Get-DmrModelId {
+    param([Parameter(Mandatory)] $InferenceProfile)
+    $r = Invoke-NativeQuiet docker model inspect $InferenceProfile['MODEL_REF']
+    if ($r.ExitCode -ne 0) { return $null }
+    try { return (($r.Output | ForEach-Object { "$_" }) -join "`n" | ConvertFrom-Json).id } catch { return $null }
+}
+
+function Test-DmrModelLoaded {
+    param([Parameter(Mandatory)] $InferenceProfile)
+    $r = Invoke-NativeQuiet docker model ps
+    $short = $InferenceProfile['MODEL_DIGEST'].Replace('sha256:', '').Substring(0, 12)
+    $name = ($InferenceProfile['MODEL_REF'] -replace '^ai/', '')
+    foreach ($line in $r.Output) {
+        $s = "$line"
+        if ($s -match [regex]::Escape($name) -or $s -match $short) { return $true }
+    }
+    return $false
+}
+
+function Invoke-DmrUnloadAll {
+    # `docker model unload --all` reports "No models are running" for models loaded with keep-alive -1,
+    # so unload each entry by the name `docker model ps` prints.
+    $r = Invoke-NativeQuiet docker model ps
+    $names = @($r.Output | Select-Object -Skip 1 | ForEach-Object { ("$_".Trim() -split '\s+')[0] } | Where-Object { $_ })
+    foreach ($n in $names) { $null = Invoke-Native docker model unload $n }
+    return $names.Count
+}
+
+function Test-DmrTcpListening {
+    param([Parameter(Mandatory)] $InferenceProfile)
+    $c = Get-NetTCPConnection -LocalPort ([int]$InferenceProfile['DMR_TCP_PORT']) -State Listen -ErrorAction SilentlyContinue
+    return [bool]$c
+}
+
