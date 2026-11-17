@@ -83,12 +83,15 @@ Budget for the selected profile (`GPU_MEMORY_UTILIZATION=0.86` -> 0.86 x 23.89 =
 
 | Component | GiB |
 | --- | --- |
-| INT4 weights, text-only (18.60 GB file minus ~0.92 GB vision tower; MTP head not loaded) | 16.5 |
-| CUDA context + activation peak (4,096 batched tokens, eager) | 1.5 |
+| INT4 weights, text-only, MTP head not loaded (measured: "Model loading took 16.71 GiB") | 16.7 |
+| CUDA context / non-torch (~1.1) + activation peak at 4,096 batched tokens, eager (0.57) (measured) | 1.7 |
 | KV for one full 16,384-token sequence (FP8) | 0.5 |
 | Linear-attention state, 4 sequences (fp32) | 0.57 |
-| **Required minimum** | **19.07** |
-| Spare for additional KV (shared by concurrent requests) | ~1.5 (~45 K tokens) |
+| **Required minimum** | **19.47** |
+| Spare for additional KV (shared by concurrent requests) | ~1.1 |
+
+Pre-measurement estimates were 16.5 GiB weights / 1.5 GiB overhead (19.07 GiB required); the profile now
+carries the measured values.
 
 The 0.86 budget plus ~2 GiB desktop usage leaves ~1.3 GiB of the card untouched, which vLLM needs for
 allocations outside its budget (e.g. CUDA graph capture is what failed on a 32 GB RTX 5090 with NVFP4,
@@ -130,6 +133,20 @@ overhead already exceed the 20.55 GiB budget before any KV cache.
    `MAX_MODEL_LEN=32768`, MTP speculative decoding via
    `EXTRA_VLLM_ARGS=--speculative-config {"method":"mtp","num_speculative_tokens":1}` (loads the 0.85 GB MTP head).
 
-## Measured results
+## Measured results (2026-11-17, profile above, eager mode)
 
-See the Phase 1 section of the README / end-of-phase report; updated after each tuning run.
+| Metric | Value |
+| --- | --- |
+| Download (19.45 GB, unauthenticated HF) | ~5 min (~65 MB/s); SHA-256 of both safetensors files matches the Hub LFS oids |
+| Weight load from `C:\university-ai\models` (9P bind mount) | 55.7 s; container healthy 152 s after `docker run` |
+| Kernels selected | `MarlinLinearKernel` (CompressedTensorsWNA16), FlashInfer GDN prefill, FLASHINFER attention |
+| vLLM memory | free at start 22.4 / 23.87 GiB; weights + non-torch 17.8 GiB; peak activations 0.57 GiB; KV cache 2.15 GiB available |
+| KV pool | 18,022 tokens (extended to 22 blocks of 1,600 tokens); max concurrency at a full 16,384-token request: **1.10x** |
+| GPU memory in use while serving | 21.3 / 23.9 GiB (incl. ~2 GiB desktop) |
+| Decode, 1 request x 512 tokens | 17.9 tok/s |
+| Decode, 4 parallel x 512 tokens | 66.5 tok/s aggregate, 17.2 tok/s per request |
+
+Interpretation: four short/medium conversations can decode in parallel at ~17 tok/s each, but only about one
+request can use the full 16K window at a time; the backend queue (Phase 2) must enforce this. Eager mode costs
+decode speed (the card's ~670 GB/s bandwidth over ~16.7 GiB of weights allows roughly 2x more); CUDA graphs and
+MTP are the first tuning steps.
